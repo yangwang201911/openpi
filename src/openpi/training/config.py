@@ -1,5 +1,6 @@
 """See _CONFIGS for the list of available configs."""
 
+import openpi.training.piper_config_jax as piper_config_jax 
 import abc
 from collections.abc import Sequence
 import dataclasses
@@ -81,6 +82,9 @@ class DataConfig:
     model_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantile_norm: bool = False
+
+    # If true, convert absolute actions to delta actions during data transform setup.
+    extra_delta_transform: bool = False
 
     # Names of keys that will be used by the data loader to generate the action sequence. The length of the
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
@@ -968,6 +972,7 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
+    *piper_config_jax.get_piper_configs(),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
