@@ -68,7 +68,24 @@ class Policy(BasePolicy):
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+
+        # Real-time chunking (RTC) control fields, if the client provided them. The scalar
+        # control params are static; the previous action chunk is routed through the same
+        # action transforms (delta + normalize) as a training action so it lands in the
+        # model's normalized action space, re-referenced to the current state.
+        rtc_kwargs = {}
+        for key in ("inference_delay", "prefix_attention_horizon", "prefix_attention_schedule", "max_guidance_weight"):
+            if key in inputs:
+                rtc_kwargs[key] = inputs.pop(key)
+        prev_action_chunk = inputs.pop("prev_action_chunk", None)
+        if prev_action_chunk is not None:
+            inputs["actions"] = prev_action_chunk
+
         inputs = self._input_transform(inputs)
+
+        # Pull the (now-normalized) previous chunk back out before building the Observation.
+        normalized_prev_chunk = inputs.pop("actions", None)
+
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
@@ -86,6 +103,12 @@ class Policy(BasePolicy):
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
+
+        # Wire RTC kwargs for JAX models (the PyTorch pi0 path does not implement RTC sampling).
+        if not self._is_pytorch_model:
+            sample_kwargs.update(rtc_kwargs)
+            if normalized_prev_chunk is not None:
+                sample_kwargs["prev_action_chunk"] = jnp.asarray(normalized_prev_chunk)[np.newaxis, ...]
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()

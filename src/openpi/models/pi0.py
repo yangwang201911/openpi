@@ -1,4 +1,5 @@
 import logging
+from typing import Literal, TypeAlias
 
 import einops
 import flax.nnx as nnx
@@ -61,6 +62,34 @@ def posemb_sincos(
         precision=jax.lax.Precision.HIGHEST,
     )
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
+
+
+PrefixAttentionSchedule: TypeAlias = Literal["linear", "exp", "ones", "zeros"]
+
+
+def get_prefix_weights(start: int, end: int, total: int, schedule: PrefixAttentionSchedule) -> jax.Array:
+    """Per-position weights for RTC prefix attention (soft inpainting guidance).
+
+    With start=2, end=6, total=10, the output is:
+        1  1  4/5 3/5 2/5 1/5 0  0  0  0
+               ^              ^
+             start           end
+    `start` (inclusive) is where the chunk starts being allowed to change; `end`
+    (exclusive) is where the chunk stops paying attention to the previous plan.
+    `end` takes precedence: if `end < start`, `start` is pushed down to `end`.
+    """
+    start = jnp.minimum(start, end)
+    if schedule == "ones":
+        w = jnp.ones(total)
+    elif schedule == "zeros":
+        w = (jnp.arange(total) < start).astype(jnp.float32)
+    elif schedule == "linear" or schedule == "exp":
+        w = jnp.clip((start - 1 - jnp.arange(total)) / (end - start + 1) + 1, 0, 1)
+        if schedule == "exp":
+            w = w * jnp.expm1(w) / (jnp.e - 1)
+    else:
+        raise ValueError(f"Invalid schedule: {schedule}")
+    return jnp.where(jnp.arange(total) >= end, 0, w)
 
 
 class Pi0(_model.BaseModel):
@@ -221,6 +250,11 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        prev_action_chunk: at.Float[at.Array, "b ah ad"] | None = None,
+        inference_delay: int = 0,
+        prefix_attention_horizon: int | None = None,
+        prefix_attention_schedule: PrefixAttentionSchedule = "exp",
+        max_guidance_weight: float = 5.0,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -236,8 +270,7 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
-        def step(carry):
-            x_t, time = carry
+        def compute_velocity(x_t, time):
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
@@ -266,9 +299,44 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            return self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-            return x_t + dt * v_t, time + dt
+        if prev_action_chunk is None:
+
+            def step(carry):
+                x_t, time = carry
+                v_t = compute_velocity(x_t, time)
+                return x_t + dt * v_t, time + dt
+
+        else:
+            # Inference-time real-time chunking (soft inpainting guidance). We softly pin the leading
+            # part of the chunk to the previously predicted actions so that replanning stays consistent
+            # with what is already executing. This requires no retraining; see Black et al., "Real-Time
+            # Chunking". The time axis here runs 1 -> 0 (opposite of the kinetix reference), which flips
+            # the sign of the guidance correction below.
+            horizon = self.action_horizon if prefix_attention_horizon is None else prefix_attention_horizon
+            weights = get_prefix_weights(inference_delay, horizon, self.action_horizon, prefix_attention_schedule)
+
+            def step(carry):
+                x_t, time = carry
+
+                def denoiser(x_t):
+                    v_t = compute_velocity(x_t, time)
+                    # x is linear in time along the flow ODE, so the predicted clean action (time=0) is:
+                    x_0_pred = x_t - time * v_t
+                    return x_0_pred, v_t
+
+                x_0_pred, vjp_fun, v_t = jax.vjp(denoiser, x_t, has_aux=True)
+                error = (prev_action_chunk - x_0_pred) * weights[None, :, None]
+                pinv_correction = vjp_fun(error)[0]
+                # guidance weight constants from the RTC paper; `1 - time` is the fraction of the way to
+                # the clean action under openpi's reversed time convention.
+                inv_r2 = ((1 - time) ** 2 + time**2) / (time**2)
+                c = jnp.nan_to_num(time / (1 - time), posinf=max_guidance_weight)
+                guidance_weight = jnp.minimum(c * inv_r2, max_guidance_weight)
+                # minus (not plus as in kinetix): openpi integrates time downward (dt < 0).
+                v_t = v_t - guidance_weight * pinv_correction
+                return x_t + dt * v_t, time + dt
 
         def cond(carry):
             x_t, time = carry
