@@ -95,12 +95,17 @@ class PiperRelRotAbsoluteActions:
 
 def get_piper_configs():
     """返回 Piper 的 JAX 训练配置列表。
-    
+
     四个配置都走 openpi JAX 后端（scripts/train.py）：
     - pi05_piper            ：全量微调（显存需求高）。
     - pi05_piper_lora       ：LoRA 微调（显存节省）。
     - pi0_piper             ：Pi0 全量微调。
     - pi0_piper_low_mem     ：Pi0 LoRA 微调。
+
+    另有关节(joint)空间配置（数据集由 convert_piper_data_to_lerobot.py
+    --control-space joint 产出，state/action 各 7 维 = 6 关节角 + 夹爪）：
+    - pi05_piper_lora_joint           ：LoRA 微调，关节角 delta（默认，逐元素相减，夹爪绝对）。
+    - pi05_piper_lora_joint_absolute  ：LoRA 微调，直接学习绝对关节角。
     """
     # 延迟导入：避免循环导入 config.py
     from typing_extensions import override
@@ -196,6 +201,69 @@ def get_piper_configs():
                 action_sequence_keys=("action",),
             )
 
+    @dataclasses.dataclass(frozen=True)
+    class LeRobotPiperJointDataConfig(DataConfigFactory):
+        """把本项目的 Piper **关节空间** LeRobot 数据集接入 openpi JAX 训练管线。
+
+        state/action 都是 7 维 `[q1,...,q6, gripper]`（6 关节角弧度 + 夹爪归一化，
+        数据集由 convert_piper_data_to_lerobot.py --control-space joint 产出）。
+        """
+
+        # action_space: "delta" (默认) | "absolute"。
+        #   delta    : 6 关节角逐元素相减(action - state)，夹爪保持绝对。
+        #   absolute : 不做变换，直接学习绝对关节角。
+        action_space: str = "delta"
+
+        @override
+        def create(self, assets_dirs, model_config):
+            # repack：与 EE 数据集列名一致（各自 repo_id 指向不同的数据集实例）。
+            repack_transform = _transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "observation/image": "observation.images.cam_global",
+                            "observation/wrist_image": "observation.images.cam_gripper",
+                            "observation/state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            )
+
+            data_transforms = _transforms.Group(
+                inputs=[
+                    # PiperInputs 只做 pad_to_dim，对 EE/关节两种空间通用。
+                    piper_policy.PiperInputs(
+                        action_dim=model_config.action_dim,
+                        model_type=model_config.model_type,
+                    )
+                ],
+                outputs=[piper_policy.PiperJointOutputs()],
+            )
+            # 6 关节角做 delta、第 7 维夹爪保持绝对；输出侧对称做 AbsoluteActions 还原。
+            if self.action_space == "delta":
+                data_transforms = data_transforms.push(
+                    inputs=[_transforms.DeltaActions(_transforms.make_bool_mask(6, -1))],
+                    outputs=[_transforms.AbsoluteActions(_transforms.make_bool_mask(6, -1))],
+                )
+            elif self.action_space == "absolute":
+                pass  # 直接学习绝对关节角，无 delta/absolute 变换
+            else:
+                raise ValueError(
+                    f"unknown action_space={self.action_space!r}; expected delta/absolute"
+                )
+
+            model_transforms = ModelTransformFactory()(model_config)
+
+            return dataclasses.replace(
+                self.create_base_config(assets_dirs, model_config),
+                repack_transforms=repack_transform,
+                data_transforms=data_transforms,
+                model_transforms=model_transforms,
+                action_sequence_keys=("action",),
+            )
+
     return [
         # ===== Pi05 全量微调 =====
         TrainConfig(
@@ -249,7 +317,7 @@ def get_piper_configs():
             ),
             ema_decay=None,
             batch_size=16,
-            num_train_steps=100_000,
+            num_train_steps=30_000,
             freeze_filter=pi0_config.Pi0Config(
                 pi05=True,
                 paligemma_variant="gemma_2b_lora",
@@ -283,7 +351,7 @@ def get_piper_configs():
             ),
             ema_decay=None,
             batch_size=16,
-            num_train_steps=300_000,
+            num_train_steps=30_000,
             freeze_filter=pi0_config.Pi0Config(
                 pi05=True,
                 paligemma_variant="gemma_2b_lora",
@@ -376,6 +444,73 @@ def get_piper_configs():
             batch_size=64,
             num_train_steps=30_000,
             freeze_filter=pi0_config.Pi0Config(
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ).get_freeze_filter(),
+        ),
+        # ===== Pi05 LoRA - 关节空间：delta（默认，6 关节角逐元素相减，夹爪绝对） =====
+        TrainConfig(
+            name="pi05_piper_lora_joint",
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                action_dim=PI05_ACTION_DIM,
+                action_horizon=PIPER_ACTION_HORIZON,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ),
+            data=LeRobotPiperJointDataConfig(
+                repo_id=PIPER_REPO_ID,
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                "gs://openpi-assets/checkpoints/pi05_base/params"
+            ),
+            optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                peak_lr=1e-4,
+                decay_steps=1_000_000,
+                decay_lr=1e-5,
+            ),
+            ema_decay=None,
+            batch_size=16,
+            num_train_steps=50_000,
+            freeze_filter=pi0_config.Pi0Config(
+                pi05=True,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ).get_freeze_filter(),
+        ),
+        # ===== Pi05 LoRA - 关节空间：absolute（直接学习绝对关节角） =====
+        TrainConfig(
+            name="pi05_piper_lora_joint_absolute",
+            model=pi0_config.Pi0Config(
+                pi05=True,
+                action_dim=PI05_ACTION_DIM,
+                action_horizon=PIPER_ACTION_HORIZON,
+                paligemma_variant="gemma_2b_lora",
+                action_expert_variant="gemma_300m_lora",
+            ),
+            data=LeRobotPiperJointDataConfig(
+                repo_id=PIPER_REPO_ID,
+                base_config=DataConfig(prompt_from_task=True),
+                action_space="absolute",
+            ),
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                "gs://openpi-assets/checkpoints/pi05_base/params"
+            ),
+            optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                peak_lr=1e-4,
+                decay_steps=1_000_000,
+                decay_lr=1e-5,
+            ),
+            ema_decay=None,
+            batch_size=16,
+            num_train_steps=30_000,
+            freeze_filter=pi0_config.Pi0Config(
+                pi05=True,
                 paligemma_variant="gemma_2b_lora",
                 action_expert_variant="gemma_300m_lora",
             ).get_freeze_filter(),

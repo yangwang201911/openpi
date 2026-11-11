@@ -6,9 +6,12 @@
 
 约定（与本项目 LeRobot 数据集 / 真机部署一致）：
 - 两路相机：第三视角 `observation/image`、腕部 `observation/wrist_image`，uint8 (H,W,3)。
-- 状态为 **10 维**：`[x,y,z, r00,r10,r20, r01,r11,r21, gripper]`，**绝对末端位姿**（位置 + 6D旋转 + 夹爪）。
-- 动作为 **10 维**：`[dx,dy,dz, dr00,dr10,dr20, dr01,dr11,dr21, gripper]`，**增量末端位姿** + 夹爪绝对值。
-- pi05 模型内部按 32 维处理，这里 pad/截断在 32 维和 10 维之间转换。
+- 末端位姿(EE)空间：状态/动作各 **10 维** `[x,y,z, r00,r10,r20, r01,r11,r21, gripper]`
+  （位置 + 6D旋转 + 夹爪），动作为增量或绝对由训练 config 的 action_space 决定。
+- 关节(joint)空间：状态/动作各 **7 维** `[q1..q6, gripper]`（6 关节角弧度 + 夹爪归一化）。
+- pi05 模型内部按 32 维处理，这里 pad/截断在 32 维和 10/7 维之间转换。PiperInputs
+  对两种空间通用（只做 pad_to_dim，不关心语义）；PiperOutputs 截回 EE 10 维，
+  PiperJointOutputs 截回关节 7 维，训练 config 二选一。
 
 inference 阶段 `deploy_policy.py` 下发的观测键名与下方 PiperInputs 期望完全一致：
 `observation/image` / `observation/wrist_image` / `observation/state` / `prompt`。
@@ -24,6 +27,8 @@ from openpi.models import model as _model
 
 # Piper 单臂：末端位姿 9 维（3 位置 + 6D 旋转）+ 1 夹爪 = 10 维。改本体时同步改这里和 PiperOutputs 的切片。
 PIPER_ACTION_DIM = 10
+# 关节空间：6 关节角 + 1 夹爪 = 7 维。改本体时同步改这里和 PiperJointOutputs 的切片。
+PIPER_JOINT_ACTION_DIM = 7
 
 
 def make_piper_example() -> dict:
@@ -100,3 +105,12 @@ class PiperOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         # 训练时 pad 到 32 维，这里取回前 10 维 = [dx,dy,dz, dr00,dr10,dr20, dr01,dr11,dr21, gripper]。
         return {"actions": np.asarray(data["actions"][..., :PIPER_ACTION_DIM])}
+
+
+@dataclasses.dataclass(frozen=True)
+class PiperJointOutputs(transforms.DataTransformFn):
+    """把模型输出截回 Piper 的 7 维关节空间动作（仅推理用）。"""
+
+    def __call__(self, data: dict) -> dict:
+        # 训练时 pad 到 32 维，这里取回前 7 维 = [q1..q6, gripper]。
+        return {"actions": np.asarray(data["actions"][..., :PIPER_JOINT_ACTION_DIM])}

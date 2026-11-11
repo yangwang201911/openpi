@@ -1,6 +1,5 @@
 """See _CONFIGS for the list of available configs."""
 
-import openpi.training.piper_config_jax as piper_config_jax 
 import abc
 from collections.abc import Sequence
 import dataclasses
@@ -27,6 +26,7 @@ import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
+import openpi.training.piper_config_jax as piper_config_jax
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
 
@@ -82,9 +82,6 @@ class DataConfig:
     model_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantile_norm: bool = False
-
-    # If true, convert absolute actions to delta actions during data transform setup.
-    extra_delta_transform: bool = False
 
     # Names of keys that will be used by the data loader to generate the action sequence. The length of the
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
